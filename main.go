@@ -7,12 +7,10 @@ import (
 	"github.com/googollee/go-socket.io"
 )
 
-var r RoomMap
-
 // For now, let's just make an example WebRTC setup send an example audio file and focus on making the client work
 func main() {
 	// Create a websocket server for WebRTC authentication as well as other API functions
-	r = make(RoomMap, 0)
+	initDB()
 	initServer()
 }
 

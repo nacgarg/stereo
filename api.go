@@ -4,39 +4,22 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
-
+	"os"
+	"os/exec"
 	"regexp"
+
 	"strings"
 
+	"errors"
+
+	"github.com/BrianAllred/goydl"
+	"github.com/dchest/uniuri"
 	"github.com/googollee/go-socket.io"
 	"github.com/pions/webrtc"
 	"github.com/pions/webrtc/pkg/datachannel"
 	"github.com/pions/webrtc/pkg/ice"
+	"mvdan.cc/xurls"
 )
-
-type RoomID string
-type UserID string
-
-type RoomMap map[RoomID]*Room
-
-type Room struct {
-	Users       map[UserID]*UserConnection
-	CurrentSong string // eventualy
-}
-
-func NewRoom() *Room {
-	r := Room{}
-	r.Users = make(map[UserID]*UserConnection, 0)
-	return &r
-}
-
-type UserConnection struct {
-	Room        RoomID
-	WebSocket   *socketio.Socket
-	RTC         *webrtc.RTCPeerConnection
-	DataChannel *webrtc.RTCDataChannel
-	ReadyChan   chan int
-}
 
 func HandleSocketConnection(so socketio.Socket) {
 
@@ -50,6 +33,7 @@ func HandleSocketConnection(so socketio.Socket) {
 			so.Emit("offer", sdp)
 
 			user := UserConnection{}
+			user.ID = UserID(so.Id())
 			user.WebSocket = &so
 			user.ReadyChan = readyChan
 			user.Room = RoomID(room)
@@ -59,8 +43,9 @@ func HandleSocketConnection(so socketio.Socket) {
 			if ok {
 				roomStruct.Users[UserID(so.Id())] = &user
 			} else {
-				r[RoomID(room)] = NewRoom()
-				r[RoomID(room)].Users[UserID(so.Id())] = &user
+				ro := NewRoom(RoomID(room))
+				AddRoom(ro)
+				ro.AddUser(&user)
 			}
 
 		} else {
@@ -74,7 +59,7 @@ func HandleSocketConnection(so socketio.Socket) {
 			fmt.Println("no room")
 			return
 		}
-		user := r[RoomID(so.Rooms()[0])].Users[UserID(so.Id())]
+		user := GetRoom(RoomID(so.Rooms()[0])).GetUser(UserID(so.Id()))
 		sdp, err := base64.StdEncoding.DecodeString(answerEncoded)
 		if err != nil {
 			fmt.Println("error decoding sdp", err)
@@ -88,15 +73,71 @@ func HandleSocketConnection(so socketio.Socket) {
 			fmt.Println("error setting sdp", err)
 		}
 		<-user.ReadyChan
-		user.DataChannel.Send(datachannel.PayloadString{Data: []byte("hello")})
 	})
 
 	so.On("disconnection", func() {
 		if (len(so.Rooms())) > 0 {
-			delete(r[RoomID(so.Rooms()[0])].Users, UserID(so.Id()))
+			GetRoom(RoomID(so.Rooms()[0])).DelUserID(UserID(so.Id()))
 		}
 	})
 
+	so.On("request", func(requestStr string) {
+		if (len(so.Rooms())) == 0 {
+			fmt.Println("no room")
+			return
+		}
+		room := GetRoom(RoomID(so.Rooms()[0]))
+		user := room.GetUser(UserID(so.Id()))
+		filePath, err := downloadSong(requestStr)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		song := &Song{filePath, user, 0}
+		room.Queue.Push(song)
+	})
+
+}
+
+func downloadSong(requestStr string) (filePath string, err error) {
+	// if request isn't link, search
+	var url string
+	if xurls.Strict().MatchString(requestStr) {
+		url = xurls.Strict().FindString(requestStr)
+	} else {
+		url = "ytsearch1:" + requestStr
+	}
+
+	ytdl := goydl.NewYoutubeDl()
+	// goydl.FileSizeRateOption
+	ytdl.Options.ExtractAudio.Value = true
+	ytdl.Options.AudioFormat.Value = "wav"
+	ytdl.Options.MaxFilesize.Value = goydl.FileSizeRateFromString("200M")
+
+	ytdlFilepath := "downloads/" + uniuri.New() + ".wav" // it's not always a wav but who cares
+	ytdl.Options.Output.Value = ytdlFilepath
+
+	cmd, err := ytdl.Download(url)
+	if err != nil {
+		return "", err
+	}
+
+	cmd.Wait()
+
+	// make sure file exists. if not there probably was an error
+	if _, err := os.Stat(ytdlFilepath); os.IsNotExist(err) {
+		return "", errors.New("File doesn't exist after downloading")
+	}
+	// encode file into opus
+	opusFilepath := ytdlFilepath + ".opus"
+	bash := "ffmpeg -i " + ytdlFilepath + " -f wav -acodec pcm_s16le -ac 2 - | opusenc --hard-cbr --bitrate 128 --comp 5 - " + opusFilepath + "; rm " + ytdlFilepath
+	_, err = exec.Command("bash", "-c", bash).Output()
+	if err != nil {
+		return "", fmt.Errorf("Failed to execute command: %s", bash)
+	}
+	// delete ytdl wav
+	os.Remove(ytdlFilepath)
+	return opusFilepath, nil
 }
 
 func HandleSocketError(so socketio.Socket, err error) {
