@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/googollee/go-socket.io"
 	"github.com/pions/webrtc"
@@ -65,39 +67,53 @@ queue:
 		reader := bufio.NewReader(file)
 		buffer := make([]byte, chunksize)
 
+		log.Printf("Playing song %s to room %s\n", song.FilePath, room.ID)
+
 		for {
 			if room.Queue.skip {
+				room.Queue.skip = false
 				continue queue
 			}
 
 			// read bytes from file into buffer
-			if _, err = reader.Read(buffer); err != nil {
+			n, err := reader.Read(buffer)
+			if err != nil {
 				// EOF
 				break
 			}
-			rtcPayload := datachannel.PayloadBinary{buffer}
+			if n == 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+			rtcPayload := datachannel.PayloadBinary{buffer[:n]}
 
 			for _, user := range room.GetUsers() {
 				if user.Ready() {
 					go func() {
 						user.Lock()
-
 						err := user.DataChannel.Send(rtcPayload)
 						if err != nil {
 							fmt.Println(err)
 						}
+
 						user.Unlock()
 					}()
+				} else {
+					fmt.Println("user isn't ready")
 				}
 			}
 		}
+		log.Printf("Finished playing %s to room %s\n", song.FilePath, room.ID)
 	}
 }
 
 func GetRoom(id RoomID) *Room {
 	rLock.Lock()
 	defer rLock.Unlock()
-	return r[id]
+	if ro, ok := r[id]; ok {
+		return ro
+	}
+	return &Room{}
 }
 
 func GetRooms() []*Room {
@@ -120,8 +136,6 @@ func AddRoom(ro *Room) *Room {
 }
 
 func DelRoom(ro *Room) {
-	rLock.Lock()
-	defer rLock.Unlock()
 	DelRoomID(ro.ID)
 }
 
@@ -145,13 +159,11 @@ func (ro *Room) GetUser(id UserID) *UserConnection {
 
 func (ro *Room) AddUser(u *UserConnection) {
 	ro.UsersLock.Lock()
-	defer ro.UsersLock.Unlock()
 	ro.Users[u.ID] = u
+	ro.UsersLock.Unlock()
 }
 
 func (ro *Room) DelUser(u *UserConnection) {
-	ro.UsersLock.Lock()
-	defer ro.UsersLock.Unlock()
 	ro.DelUserID(u.ID)
 }
 
@@ -161,6 +173,7 @@ func (ro *Room) DelUserID(id UserID) {
 	delete(ro.Users, id)
 	if len(ro.Users) == 0 {
 		// if room is empty, delete it
+
 		DelRoom(ro)
 	}
 }
@@ -174,6 +187,7 @@ type UserConnection struct {
 	RTC         *webrtc.RTCPeerConnection
 	DataChannel *webrtc.RTCDataChannel
 	ReadyChan   chan int
+	Connected   bool
 }
 
 func (u *UserConnection) Ready() bool {

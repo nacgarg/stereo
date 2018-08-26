@@ -23,7 +23,7 @@ func initServer() {
 	server.On("error", HandleSocketError)
 
 	http.Handle("/socket.io/", server)
-	http.Handle("/", http.FileServer(http.Dir("./client")))
+	http.Handle("/", http.FileServer(http.Dir("./stereo-client/")))
 	log.Println("Serving at localhost:5000...")
 	log.Fatal(http.ListenAndServe(":5000", nil))
 }

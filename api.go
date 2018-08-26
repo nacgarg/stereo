@@ -25,36 +25,50 @@ func HandleSocketConnection(so socketio.Socket) {
 
 	// Client will want to join a room. We maintain a map of rooms to users in them for WebRTC
 	so.On("room", func(room string) {
-		fmt.Println(room)
 		if isRoomValid(room) {
+			log.Printf("Request from client %s to join room %s\n", so.Id(), room)
 			so.Join(room)
 			readyChan := make(chan int)
-			conn, sdp, dataChannel := NewOffer(readyChan)
-			so.Emit("offer", sdp)
+			deadChan := make(chan int)
 
-			user := UserConnection{}
+			conn, sdp, dataChannel := NewOffer(readyChan, deadChan)
+			err := so.Emit("offer", sdp)
+			if err != nil {
+				fmt.Println(err)
+			}
+			log.Printf("Sent WebRTC signaling offer to client %s\n", so.Id())
+
+			user := &UserConnection{}
 			user.ID = UserID(so.Id())
 			user.WebSocket = &so
 			user.ReadyChan = readyChan
 			user.Room = RoomID(room)
 			user.RTC = conn
 			user.DataChannel = dataChannel
+			rLock.Lock()
 			roomStruct, ok := r[RoomID(room)]
+			rLock.Unlock()
+			go func() {
+				<-deadChan
+				log.Printf("Client %s has been disconnected\n", so.Id())
+				if roomStruct != nil {
+					roomStruct.DelUser(user)
+				}
+			}()
 			if ok {
-				roomStruct.Users[UserID(so.Id())] = &user
+				roomStruct.AddUser(user)
 			} else {
 				ro := NewRoom(RoomID(room))
 				AddRoom(ro)
-				ro.AddUser(&user)
+				ro.AddUser(user)
 			}
-
 		} else {
+			log.Println("Invalid room")
 			so.Disconnect()
 		}
-
 	})
 	so.On("answer", func(answerEncoded string) {
-		log.Println("answer:", answerEncoded)
+		log.Printf("Received SDP answer from client %s\n", so.Id())
 		if (len(so.Rooms())) == 0 {
 			fmt.Println("no room")
 			return
@@ -63,7 +77,7 @@ func HandleSocketConnection(so socketio.Socket) {
 		sdp, err := base64.StdEncoding.DecodeString(answerEncoded)
 		if err != nil {
 			fmt.Println("error decoding sdp", err)
-			so.Disconnect()
+			return
 		}
 		err = user.RTC.SetRemoteDescription(webrtc.RTCSessionDescription{
 			Type: webrtc.RTCSdpTypeAnswer,
@@ -71,8 +85,11 @@ func HandleSocketConnection(so socketio.Socket) {
 		})
 		if err != nil {
 			fmt.Println("error setting sdp", err)
+			return
 		}
 		<-user.ReadyChan
+		user.Connected = true
+		log.Printf("Connected to client %s\n", so.Id())
 	})
 
 	so.On("disconnection", func() {
@@ -88,18 +105,21 @@ func HandleSocketConnection(so socketio.Socket) {
 		}
 		room := GetRoom(RoomID(so.Rooms()[0]))
 		user := room.GetUser(UserID(so.Id()))
+		log.Printf("Downlading song %s from client %s\n", requestStr, so.Id())
 		filePath, err := downloadSong(requestStr)
 		if err != nil {
 			log.Println(err)
 			return
 		}
 		song := &Song{filePath, user, 0}
+		log.Printf("Queued song %s from client %s\n", filePath, so.Id())
 		room.Queue.Push(song)
 	})
 
 }
 
 func downloadSong(requestStr string) (filePath string, err error) {
+	// return "downloads/9SA7gWn6aSBSM7yc.wav.opus", nil // for testing
 	// if request isn't link, search
 	var url string
 	if xurls.Strict().MatchString(requestStr) {
@@ -150,7 +170,7 @@ func isRoomValid(room string) bool {
 	return roomRe.MatchString(strings.ToLower(room))
 }
 
-func NewOffer(ready chan int) (*webrtc.RTCPeerConnection, string, *webrtc.RTCDataChannel) {
+func NewOffer(ready chan int, dead chan int) (*webrtc.RTCPeerConnection, string, *webrtc.RTCDataChannel) {
 	peerConnection, err := webrtc.New(webrtc.RTCConfiguration{
 		ICEServers: []webrtc.RTCICEServer{
 			{
@@ -162,36 +182,21 @@ func NewOffer(ready chan int) (*webrtc.RTCPeerConnection, string, *webrtc.RTCDat
 		panic(err)
 	}
 
-	peerConnection.Ondatachannel = func(d *webrtc.RTCDataChannel) {
-		fmt.Printf("New DataChannel %s %d\n", d.Label, d.ID)
-
-		d.Lock()
-		defer d.Unlock()
-		d.Onmessage = func(payload datachannel.Payload) {
-			switch p := payload.(type) {
-			case *datachannel.PayloadString:
-				fmt.Printf("Message '%s' from DataChannel '%s' payload '%s'\n", p.PayloadType().String(), d.Label, string(p.Data))
-			case *datachannel.PayloadBinary:
-				fmt.Printf("Message '%s' from DataChannel '%s' payload '% 02x'\n", p.PayloadType().String(), d.Label, p.Data)
-			default:
-				fmt.Printf("Message '%s' from DataChannel '%s' no payload \n", p.PayloadType().String(), d.Label)
-			}
-		}
-	}
-
 	dataChannel, err := peerConnection.CreateDataChannel("data", nil)
 	if err != nil {
 		fmt.Println("error creating datachannel", err)
 	}
 	peerConnection.OnICEConnectionStateChange = func(connectionState ice.ConnectionState) {
-		fmt.Printf("Connection State has changed %s \n", connectionState.String())
+		peerConnection.IceConnectionState = connectionState
 		if connectionState == ice.ConnectionStateConnected {
-			fmt.Println("sending openchannel")
 			err := dataChannel.SendOpenChannelMessage()
 			if err != nil {
-				fmt.Println("faild to send openchannel", err)
+				fmt.Println("failed to send openchannel", err)
 			}
 			ready <- 1
+		}
+		if connectionState == ice.ConnectionStateDisconnected {
+			dead <- 1
 		}
 	}
 	dataChannel.Lock()
@@ -208,6 +213,10 @@ func NewOffer(ready chan int) (*webrtc.RTCPeerConnection, string, *webrtc.RTCDat
 	dataChannel.Unlock()
 
 	offer, err := peerConnection.CreateOffer(nil)
+	if err != nil {
+		panic(err)
+	}
+
 	if err != nil {
 		panic(err)
 	}
